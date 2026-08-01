@@ -32,11 +32,13 @@ from . import store
 # already paid for.
 REVIVABLE = ("failed", "superseded")
 
-# Why enqueue was called. 'live' is a webhook delivery or the drain re-queueing
-# the SHA that overtook a stale job — something happened to this PR just now.
-# 'reconcile' is the startup sweep re-deriving open PRs from the API, which runs
-# whether or not anything changed and so is the only caller that can repeat.
-# FAILED_REVIVE_COOLOFF_SECONDS is charged to that repetition, not to the row.
+# Why enqueue was called, which is what decides the terms a 'failed' row comes
+# back on. 'live' means something happened to this PR just now: the drain
+# re-queueing the SHA that overtook a stale job today, and Task 6's webhook
+# handler next. 'reconcile' is the startup sweep re-deriving open PRs from the
+# API — it runs whether or not anything changed, which makes it the only caller
+# that repeats, and FAILED_REVIVE_COOLOFF_SECONDS is charged to that repetition
+# rather than to the row.
 Trigger = Literal["live", "reconcile"]
 
 # How long a job that burned every attempt is left alone before the reconcile
@@ -193,7 +195,7 @@ def _revive(
     # Anything that is not the sweep gets the live terms. A mistyped trigger
     # therefore costs at most what this branch cost before the cooloff existed
     # (max_attempts, bounded), never a review that silently never happens —
-    # and the sweep's own value is pinned behaviourally by
+    # and the sweep's own value is pinned behaviorally by
     # test_reconcile_all_revives_a_pr_that_burned_all_its_attempts.
     if trigger == "reconcile":
         failed = and_(
