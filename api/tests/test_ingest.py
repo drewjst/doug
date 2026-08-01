@@ -1,5 +1,8 @@
+from datetime import UTC, datetime, timedelta
+
 import pytest
 from sqlalchemy import create_engine, select
+from sqlalchemy.exc import IntegrityError
 
 from doug import ingest, store
 from doug.models import Band, Reason, Verdict
@@ -30,6 +33,19 @@ def _jobs(url: str) -> list[dict]:
                 select(store.review_jobs).order_by(store.review_jobs.c.id)
             ).mappings()
         ]
+
+
+def _age_started_at(url: str, job_id: int, seconds: int) -> None:
+    """Push a claimed job's started_at into the past, standing in for real
+    wall-clock time passing while an instance holds (or crashes with) a
+    claim — reclaim_stalled's lease check has no other way to be exercised
+    without an actual multi-minute sleep."""
+    with create_engine(url).begin() as conn:
+        conn.execute(
+            store.review_jobs.update()
+            .where(store.review_jobs.c.id == job_id)
+            .values(started_at=datetime.now(UTC) - timedelta(seconds=seconds))
+        )
 
 
 def test_enqueue_suppresses_a_redelivered_push(tmp_path, monkeypatch):
@@ -246,3 +262,136 @@ def test_supersede_retires_a_job_whose_sha_is_no_longer_the_head(tmp_path, monke
 
     assert ingest.enqueue(INSTALL, REPO_ID, REPO, 7, "a" * 40) == job_id
     assert {j["id"]: j for j in _jobs(url)}[job_id]["status"] == "pending"
+
+
+def test_reclaim_stalled_re_pends_a_running_job_past_its_lease(tmp_path, monkeypatch):
+    """A crashed instance leaves its claim at 'running' forever — nothing
+    else in this module can bring the row back, because REVIVABLE excludes
+    'running' on purpose. This is the only path that turns an abandoned
+    claim back into reviewable work, and it must not charge the crash as an
+    attempt against the job."""
+    url = _db(tmp_path, monkeypatch)
+    job_id = ingest.enqueue(INSTALL, REPO_ID, REPO, 7, "a" * 40)
+    ingest.claim()
+    _age_started_at(url, job_id, seconds=ingest.STALL_LEASE_SECONDS + 1)
+
+    assert ingest.reclaim_stalled() == 1
+    row = {j["id"]: j for j in _jobs(url)}[job_id]
+    assert row["status"] == "pending" and row["attempts"] == 0
+    assert row["started_at"] is None
+
+
+def test_reclaim_stalled_leaves_a_fresh_claim_strictly_alone(tmp_path, monkeypatch):
+    """The anti-double-spend guarantee: a job a live worker is still holding
+    must never be re-pended out from under it, or two workers pay for the
+    same model read of the same SHA. Only claims older than the lease are
+    fair game."""
+    url = _db(tmp_path, monkeypatch)
+    job_id = ingest.enqueue(INSTALL, REPO_ID, REPO, 7, "a" * 40)
+    ingest.claim()
+
+    assert ingest.reclaim_stalled() == 0
+    row = {j["id"]: j for j in _jobs(url)}[job_id]
+    assert row["status"] == "running"
+
+
+def test_a_reclaimed_job_rejoins_the_ordinary_lifecycle(tmp_path, monkeypatch):
+    """Without reclaim, a crashed instance's claim is a dead end: 'running'
+    is never claimed again and a later enqueue collides with it forever, so
+    reconcile can never queue that PR's review again, on any restart. Once
+    reclaimed the row is ordinary pending work — claimable, and if it goes
+    on to fail out, revivable by a later enqueue exactly like any other
+    failed job. This is the guarantee the module docstring now promises in
+    place of the durability claim it used to overstate."""
+    url = _db(tmp_path, monkeypatch)
+    job_id = ingest.enqueue(INSTALL, REPO_ID, REPO, 7, "a" * 40)
+    ingest.claim()
+    _age_started_at(url, job_id, seconds=ingest.STALL_LEASE_SECONDS + 1)
+    ingest.reclaim_stalled()
+
+    assert ingest.claim()["id"] == job_id  # claimable again, not stuck
+
+    for _ in range(3):
+        ingest.fail(job_id, "still broken")
+    assert ingest.enqueue(INSTALL, REPO_ID, REPO, 7, "a" * 40) == job_id
+
+
+def test_reclaim_stalled_is_a_no_op_when_storage_is_disabled(monkeypatch):
+    """Storage-disabled is a no-op here, matching claim() rather than the
+    RuntimeError the rest of this module raises — drain and reconcile call
+    this unconditionally on a cadence and must not need a try/except."""
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    assert ingest.reclaim_stalled() == 0
+
+
+def test_claim_returns_none_when_storage_is_disabled(monkeypatch):
+    """claim() is worker.drain's stop condition and its safe no-op on an
+    unconfigured deployment — the locked contract returns None for both an
+    empty queue and a missing ledger, with no exception either way, which is
+    what lets drain skip a try/except around it."""
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    assert ingest.claim() is None
+
+
+def test_enqueue_only_swallows_the_review_jobs_unique_violation(tmp_path, monkeypatch):
+    """The IntegrityError catch around the insert exists to turn one
+    specific collision — the uq_review_job dedupe index — into a revive-or-
+    None result. It must not silently absorb an unrelated constraint
+    violation on a table this code doesn't even touch and misreport it as
+    'already queued'; that is exactly the silent-success mode the
+    RuntimeError guard on a missing ledger exists to prevent elsewhere in
+    this module. Exercises a real IntegrityError from a different table's
+    unique constraint, not a mock, so the discriminator is proven against
+    genuine driver error text."""
+    _db(tmp_path, monkeypatch)
+    engine = store._get_engine()
+    row = {
+        "installation_id": INSTALL,
+        "github_repo_id": REPO_ID,
+        "full_name": REPO,
+        "state": "active",
+        "updated_at": datetime.now(UTC),
+    }
+    with engine.begin() as conn:
+        conn.execute(store.installation_repos.insert(), row)
+    with pytest.raises(IntegrityError) as exc_info:
+        with engine.begin() as conn:
+            conn.execute(store.installation_repos.insert(), row)
+    assert not ingest._is_dedupe_collision(exc_info.value)
+
+
+def test_complete_clears_a_stale_error_from_earlier_failed_attempts(tmp_path, monkeypatch):
+    """A job that failed once and then succeeded on retry must not land
+    'done' still carrying the error text from the attempt that didn't work —
+    a reader checking why a PR wasn't reviewed would be told about a problem
+    that no longer exists."""
+    url = _db(tmp_path, monkeypatch)
+    job_id = ingest.enqueue(INSTALL, REPO_ID, REPO, 7, "a" * 40)
+    ingest.fail(job_id, "transient timeout")
+
+    ingest.complete(job_id, None)
+    row = {j["id"]: j for j in _jobs(url)}[job_id]
+    assert row["status"] == "done" and row["error"] is None
+
+
+def test_a_revived_job_clears_a_stray_verdict_id(tmp_path, monkeypatch):
+    """_revive's reset list is the invariant for what "never reviewed" means
+    on a revived row; verdict_id belongs in it even though no code path
+    today leaves one behind on a failed or superseded row — complete() only
+    ever sets verdict_id on its way to 'done', which isn't revivable. Seeds
+    one directly to hold that invariant even if a future change ever makes
+    it reachable, rather than trusting it by omission."""
+    url = _db(tmp_path, monkeypatch)
+    verdict_id = store.save_review(REPO, 7, "deterministic", VERDICT, source="app")
+    job_id = ingest.enqueue(INSTALL, REPO_ID, REPO, 7, "a" * 40)
+    ingest.supersede(job_id)
+    with create_engine(url).begin() as conn:
+        conn.execute(
+            store.review_jobs.update()
+            .where(store.review_jobs.c.id == job_id)
+            .values(verdict_id=verdict_id)
+        )
+
+    assert ingest.enqueue(INSTALL, REPO_ID, REPO, 7, "a" * 40) == job_id
+    row = {j["id"]: j for j in _jobs(url)}[job_id]
+    assert row["status"] == "pending" and row["verdict_id"] is None
