@@ -4,7 +4,14 @@ State:    building — M0 CLOSED. M1 six-tenths done, ONE PR PER TASK
           (Andrew's call, 2026-08-01: more Doug verdicts + smaller diffs
           Doug can actually read whole). Merged to main: Tasks 1-2 (#18),
           3 (#19), 4 (#20), 5 (#23), 8 (#22, ADR-0010). Task 7a
-          (reconcile functions) in flight.
+          (reconcile functions) in flight as PR #24, fix round 2.
+
+          SESSION HANDOVER 2026-08-01 13:22 PDT. Two sessions were live on
+          this plan at once; Andrew's call was to stop the older one and
+          leave a single owner. It had pushed 09fb2fe minutes earlier, so
+          verify against origin rather than against memory. There is now
+          exactly one owner — keep it that way, and check `ps` for a live
+          session in .claude/worktrees before resuming here.
 Next:     M1 Task 6 — the webhook rewrite (api/doug/api.py), carrying BOTH
           amendments in docs/superpowers/plans/2026-08-01-step-2-amendments.md
           (clock-start outcome_jobs rows; pull_request_review ingest; NO
@@ -68,6 +75,36 @@ Key facts for the executor:
   investment. Full analysis: workspace/research/phase1-entry-preregistration.md
   (workspace/ is untracked — lives only on Andrew's machine).
 
+Decisions this session (2026-08-01, PR #24 fix round 2 + Task 6 prep):
+- The failed-revive cooloff is charged to the CALLER, not to the row.
+  09fb2fe put FAILED_REVIVE_COOLOFF_SECONDS inside the shared _revive, so
+  it also suppressed the two live paths — a PR reopened or force-pushed
+  back to a failed head SHA within the hour would 202 and never be
+  reviewed. enqueue now takes `trigger`, defaulting to live; only
+  reconcile_installation's sweep passes "reconcile" — rejected: leaving the
+  cooloff in _revive (trades a bounded spend leak for a silent review
+  loss that lands on a person, not on a restart loop).
+- store.find_verdict_by_identity must ALSO exclude tier='external', which
+  the Task 6 amendment does not say. It keys on exactly the four App
+  identity columns ordered id DESC, and it is worker.process_job's
+  idempotency pre-read — so a human approval at head SHA X would satisfy
+  Doug's own idempotency check at SHA X, Doug would never review that
+  commit, and the check run would render a score=0.0 tier='external' row
+  as Doug's verdict — rejected: guarding only the two helpers the
+  amendment names.
+- latest_reviews' external exclusion goes INSIDE the grouped max(id)
+  subquery, not on the outer query: filtering outside makes a PR whose
+  newest row is external vanish from /v1/queue instead of falling back to
+  Doug's verdict — rejected: the one-line outer filter.
+- External verdict rows get a dedicated writer beside store.save_review,
+  not save_review itself (which hardcodes scored_at=now and takes a
+  Verdict, while the amendment requires scored_at=review.submitted_at and
+  no scoring code on the path) — rejected: threading a synthetic Verdict
+  and a scored_at override through the scoring writer.
+- find_review's immunity to external rows is INCIDENTAL, not designed (it
+  matches pr_meta['head_sha'] as JSON and external rows write no pr_meta).
+  The explicit exclusion goes in anyway.
+
 Decisions this session (2026-08-01, M1 Tasks 1–2):
 - outcome_jobs is a store.metadata table, NOT a migration (Global
   Constraint: new tables via create_all; migrations are for columns on
@@ -125,8 +162,9 @@ Pointers:
   M0 through M6.
 - Full session state: ../HANDOFF.md on Andrew's machine (project root,
   above this repo) is the richer, hook-maintained handoff.
-- PR #16 open: docs/outcome-loop-design-lock (design docs + landing-page
-  section + .env.example MAGPIE_*→DOUG_* fix).
+- PR #16 merged (240caf5). Open PRs: #24 only.
+- ROADMAP M1 checkboxes are STALE — Tasks 4, 5 and 8 are merged but still
+  unticked. Fold the correction into a task PR rather than a lone commit.
 - stash@{0} (queue-polish era): dashboard repoint + the lost step-1 plan
   file. Both obsolete (repoint shipped via deploy config; plan content
   landed in #14) — drop deliberately when convenient.
