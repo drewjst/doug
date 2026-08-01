@@ -338,12 +338,23 @@ def reconcile_installation(installation_id: int) -> int:
             # attempts=0, and its (non-None) id comes back, so it counts
             # here too. That's deliberate — a PR that burned every attempt
             # before a restart is healed rather than staying dead forever —
-            # but it isn't free: each restart that revives it pays for up
-            # to max_attempts model reads again. Bounded per restart (the
-            # locked interfaces' own note); not bounded across a restart
-            # loop that keeps reconciling the same broken PR.
+            # but it isn't free: a revived job pays for up to max_attempts
+            # model reads again. trigger='reconcile' is what bounds the
+            # repetition: this sweep runs on every cold start, so a 'failed'
+            # row it meets inside FAILED_REVIVE_COOLOFF_SECONDS is left
+            # alone and the same broken PR costs one budget per cooloff
+            # window rather than one per restart. This is the only caller
+            # that passes it — a live event revives immediately, because
+            # nobody reopens a PR every ninety seconds.
             if (
-                ingest.enqueue(installation_id, repo_id, full_name, p.number, head_sha)
+                ingest.enqueue(
+                    installation_id,
+                    repo_id,
+                    full_name,
+                    p.number,
+                    head_sha,
+                    trigger="reconcile",
+                )
                 is not None
             ):
                 count += 1

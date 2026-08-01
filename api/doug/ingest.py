@@ -20,8 +20,9 @@ paying for the same read twice.
 """
 
 from datetime import UTC, datetime, timedelta
+from typing import Literal
 
-from sqlalchemy import case, or_, select, update
+from sqlalchemy import and_, case, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
 from . import store
@@ -31,14 +32,25 @@ from . import store
 # already paid for.
 REVIVABLE = ("failed", "superseded")
 
-# How long a job that burned every attempt is left alone before reconcile will
-# revive it. Without this, revival is per-restart: startup reconcile re-arms a
-# permanently-broken PR, the drain burns max_attempts paid reads against it,
-# and a Cloud Run service that cold-starts often pays that bill every time.
-# Healing a genuinely transient failure (an outage, a wiped credential) is worth
-# a retry an hour later; nothing is worth retrying every ninety seconds forever.
-# Superseded rows are exempt — a force-push back to an older SHA is a live
-# instruction to review that SHA now, not a failure waiting out a penalty.
+# Why enqueue was called. 'live' is a webhook delivery or the drain re-queueing
+# the SHA that overtook a stale job — something happened to this PR just now.
+# 'reconcile' is the startup sweep re-deriving open PRs from the API, which runs
+# whether or not anything changed and so is the only caller that can repeat.
+# FAILED_REVIVE_COOLOFF_SECONDS is charged to that repetition, not to the row.
+Trigger = Literal["live", "reconcile"]
+
+# How long a job that burned every attempt is left alone before the reconcile
+# sweep will revive it. Without this, revival is per-restart: startup reconcile
+# re-arms a permanently-broken PR, the drain burns max_attempts paid reads
+# against it, and a Cloud Run service that cold-starts often pays that bill every
+# time. Healing a genuinely transient failure (an outage, a wiped credential) is
+# worth a retry an hour later; nothing is worth retrying every ninety seconds
+# forever. Two exemptions, for the same reason — the wait is a brake on a machine
+# repeating itself, never on a person. Superseded rows never wait: a force-push
+# back to an older SHA is a live instruction to review that SHA now. Neither does
+# a live enqueue of a failed row: a reopen or a force-push back to a SHA whose
+# review failed is a user event, and answering it with silence for an hour is a
+# PR that never gets reviewed.
 FAILED_REVIVE_COOLOFF_SECONDS = 3600
 
 # How long a claim may sit 'running' before reclaim_stalled treats it as
@@ -84,6 +96,8 @@ def enqueue(
     repo_full_name: str,
     pr_number: int,
     head_sha: str,
+    *,
+    trigger: Trigger = "live",
 ) -> int | None:
     """Queue one head SHA for review. None means this SHA needs no new work.
 
@@ -91,9 +105,13 @@ def enqueue(
     index carries no status column, so a row that ended 'failed' or
     'superseded' blocks re-insertion exactly like a reviewed one — and those
     are the two states reconcile exists to repair. Colliding with one revives
-    it rather than dropping the work; the cost of a permanently broken PR is
-    therefore max_attempts per reconcile, which is bounded, instead of never
-    being retried again on any restart.
+    it rather than dropping the work, on terms `trigger` decides: a live
+    caller (the default) revives either state at once, so the cost of a
+    permanently broken PR is max_attempts per user event; the reconcile sweep
+    passes trigger='reconcile' and revives a 'failed' row only once
+    FAILED_REVIVE_COOLOFF_SECONDS has elapsed since it gave up, so a service
+    that cold-starts every few minutes pays that bill per cooloff window
+    instead of per restart. Either way the PR is never dead forever.
 
     Superseding older pending SHAs happens after the insert lands and in the
     same transaction. Running it first meant a redelivered older push
@@ -135,7 +153,9 @@ def enqueue(
     except IntegrityError as e:
         if not _is_dedupe_collision(e):
             raise
-        return _revive(engine, installation_id, github_repo_id, pr_number, head_sha, now)
+        return _revive(
+            engine, installation_id, github_repo_id, pr_number, head_sha, now, trigger
+        )
 
 
 def _revive(
@@ -145,14 +165,19 @@ def _revive(
     pr_number: int,
     head_sha: str,
     now: datetime,
+    trigger: Trigger,
 ) -> int | None:
     """Return a queued-but-unreviewed row to pending, or None if there is none.
 
-    Two revivable states, deliberately on different terms. A 'superseded' row
-    revives immediately: a force-push back to an older SHA is an instruction to
-    review that SHA now. A 'failed' row waits out FAILED_REVIVE_COOLOFF_SECONDS
-    first, because reconcile runs on every startup and a permanently-broken PR
-    would otherwise re-arm max_attempts paid reads on each one.
+    A 'superseded' row revives on any caller's terms: a force-push back to an
+    older SHA is an instruction to review that SHA now. A 'failed' row revives
+    at once for a live caller too, and only the reconcile sweep makes it wait
+    out FAILED_REVIVE_COOLOFF_SECONDS from finished_at — that sweep runs on
+    every startup regardless of whether anything changed, so a
+    permanently-broken PR would otherwise re-arm max_attempts paid reads on
+    each cold start. Read off `trigger` rather than off the row, because the
+    row cannot tell the two apart: 'failed' at this SHA looks identical
+    whether a person just reopened the PR or a container just booted.
 
     The status test lives in the UPDATE's WHERE rather than in a SELECT before
     it: a concurrent drain can claim or finish the row between the two, and a
@@ -164,26 +189,31 @@ def _revive(
     seen-set of job ids, and a fresh id per revival would defeat it silently,
     turning the spin back into an unbounded loop inside a held instance.
     """
+    failed = store.review_jobs.c.status == "failed"
+    # Anything that is not the sweep gets the live terms. A mistyped trigger
+    # therefore costs at most what this branch cost before the cooloff existed
+    # (max_attempts, bounded), never a review that silently never happens —
+    # and the sweep's own value is pinned behaviourally by
+    # test_reconcile_all_revives_a_pr_that_burned_all_its_attempts.
+    if trigger == "reconcile":
+        failed = and_(
+            failed,
+            or_(
+                # NULL finished_at should not happen — fail() sets it at the
+                # cap — but if it ever does, heal rather than strand the PR
+                # forever behind a comparison it can never pass.
+                store.review_jobs.c.finished_at.is_(None),
+                store.review_jobs.c.finished_at
+                < now - timedelta(seconds=FAILED_REVIVE_COOLOFF_SECONDS),
+            ),
+        )
     with engine.begin() as conn:
         job_id = conn.execute(
             update(store.review_jobs)
             .where(
                 *_job_filter(installation_id, github_repo_id, pr_number),
                 store.review_jobs.c.head_sha == head_sha,
-                or_(
-                    store.review_jobs.c.status == "superseded",
-                    (store.review_jobs.c.status == "failed")
-                    & (
-                        # NULL finished_at should not happen — fail() sets it at
-                        # the cap — but if it ever does, heal rather than strand
-                        # the PR forever behind a comparison it can never pass.
-                        store.review_jobs.c.finished_at.is_(None)
-                        | (
-                            store.review_jobs.c.finished_at
-                            < now - timedelta(seconds=FAILED_REVIVE_COOLOFF_SECONDS)
-                        )
-                    ),
-                ),
+                or_(store.review_jobs.c.status == "superseded", failed),
             )
             .values(
                 status="pending",

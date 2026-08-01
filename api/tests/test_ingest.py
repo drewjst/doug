@@ -182,9 +182,10 @@ def test_a_failed_job_is_revived_by_a_later_enqueue(tmp_path, monkeypatch):
     provider outage — and if a collision with a 'failed' row returned None it
     would heal nothing, permanently, on that PR and every restart after.
 
-    The healing is delayed by FAILED_REVIVE_COOLOFF_SECONDS, not withheld, so
-    this ages the row past it — the cooloff bounds how often a poison PR can
-    re-arm, and is tested in its own right below."""
+    On the sweep's own terms the healing is delayed by
+    FAILED_REVIVE_COOLOFF_SECONDS, not withheld, so this ages the row past it —
+    the cooloff bounds how often a poison PR can re-arm, and is tested in its
+    own right below."""
     url = _db(tmp_path, monkeypatch)
     job_id = ingest.enqueue(INSTALL, REPO_ID, REPO, 7, "a" * 40)
     for _ in range(3):
@@ -192,7 +193,7 @@ def test_a_failed_job_is_revived_by_a_later_enqueue(tmp_path, monkeypatch):
     assert {j["id"]: j for j in _jobs(url)}[job_id]["status"] == "failed"
     _age_finished_at(url, job_id, seconds=ingest.FAILED_REVIVE_COOLOFF_SECONDS + 60)
 
-    assert ingest.enqueue(INSTALL, REPO_ID, REPO, 7, "a" * 40) == job_id
+    assert ingest.enqueue(INSTALL, REPO_ID, REPO, 7, "a" * 40, trigger="reconcile") == job_id
     row = {j["id"]: j for j in _jobs(url)}[job_id]
     assert row["status"] == "pending" and row["attempts"] == 0
     assert row["error"] is None and row["finished_at"] is None
@@ -330,7 +331,6 @@ def test_a_reclaimed_job_rejoins_the_ordinary_lifecycle(tmp_path, monkeypatch):
 
     for _ in range(3):
         ingest.fail(job_id, "still broken")
-    _age_finished_at(url, job_id, seconds=ingest.FAILED_REVIVE_COOLOFF_SECONDS + 60)
     assert ingest.enqueue(INSTALL, REPO_ID, REPO, 7, "a" * 40) == job_id
 
 
@@ -432,7 +432,35 @@ def test_the_dedupe_marker_still_matches_the_real_constraint_name():
     assert any("uq_review_job" in marker for marker in ingest._DEDUPE_COLLISION)
 
 
-def test_a_job_that_just_burned_its_attempts_is_not_revived_immediately(tmp_path, monkeypatch):
+def test_a_live_event_revives_a_failed_job_without_waiting_out_the_cooloff(
+    tmp_path, monkeypatch
+):
+    """The cooloff belongs to the caller, not to the row. A reopen, or a
+    force-push back to the SHA whose review failed during an outage, is a
+    person asking for this PR now, and what enqueue promises a live caller is
+    "queue this SHA for review". Suppressing that for an hour is a PR silently
+    never reviewed — the opposite failure from the one the cooloff exists to
+    bound, which is a restart loop re-arming a poison PR. Only the reconcile
+    sweep pays that penalty; the default caller does not.
+    """
+    url = _db(tmp_path, monkeypatch)
+    job_id = ingest.enqueue(INSTALL, REPO_ID, REPO, 7, "a" * 40)
+    for _ in range(3):
+        ingest.fail(job_id, "reader exploded")
+    row = {j["id"]: j for j in _jobs(url)}[job_id]
+    # finished_at is set and recent: the row really is inside the cooloff
+    # window, so reviving it is the caller's doing and not _revive's
+    # NULL-finished_at escape hatch.
+    assert row["status"] == "failed" and row["finished_at"] is not None
+
+    assert ingest.enqueue(INSTALL, REPO_ID, REPO, 7, "a" * 40) == job_id
+    row = {j["id"]: j for j in _jobs(url)}[job_id]
+    assert row["status"] == "pending" and row["attempts"] == 0
+
+
+def test_a_reconcile_sweep_does_not_re_arm_a_job_that_just_burned_its_attempts(
+    tmp_path, monkeypatch
+):
     """Reconcile runs on every startup, and a Cloud Run service cold-starts
     often. Without a cooloff, a permanently-broken PR is re-armed on each one
     and the drain burns max_attempts paid model reads against it every time —
@@ -446,12 +474,14 @@ def test_a_job_that_just_burned_its_attempts_is_not_revived_immediately(tmp_path
         ingest.fail(job_id, "reader exploded")
     assert {j["id"]: j for j in _jobs(url)}[job_id]["status"] == "failed"
 
-    assert ingest.enqueue(INSTALL, REPO_ID, REPO, 7, "a" * 40) is None
+    assert ingest.enqueue(INSTALL, REPO_ID, REPO, 7, "a" * 40, trigger="reconcile") is None
     row = {j["id"]: j for j in _jobs(url)}[job_id]
     assert row["status"] == "failed" and row["attempts"] == 3
 
 
-def test_a_failed_job_is_revived_once_its_cooloff_has_passed(tmp_path, monkeypatch):
+def test_a_reconcile_sweep_revives_a_failed_job_once_its_cooloff_has_passed(
+    tmp_path, monkeypatch
+):
     """The cooloff bounds the retry rate; it must not strand the PR. A genuine
     outage — wiped credentials, a provider down — has to heal on a later
     restart, which is the whole reason revive exists."""
@@ -468,19 +498,26 @@ def test_a_failed_job_is_revived_once_its_cooloff_has_passed(tmp_path, monkeypat
             .values(finished_at=stale)
         )
 
-    assert ingest.enqueue(INSTALL, REPO_ID, REPO, 7, "a" * 40) == job_id
+    assert ingest.enqueue(INSTALL, REPO_ID, REPO, 7, "a" * 40, trigger="reconcile") == job_id
     row = {j["id"]: j for j in _jobs(url)}[job_id]
     assert row["status"] == "pending" and row["attempts"] == 0
 
 
-def test_a_superseded_job_revives_immediately_despite_the_cooloff(tmp_path, monkeypatch):
-    """The cooloff is a penalty for failing, not for being overtaken. A branch
-    force-pushed back to an earlier SHA is a live instruction to review that
-    SHA now — making it wait an hour would be a bug, not a saving."""
+def test_a_superseded_job_revives_immediately_on_either_path(tmp_path, monkeypatch):
+    """The cooloff is a penalty for failing, not for being overtaken, and it is
+    charged to the caller that repeats itself — so neither reason to wait
+    applies to a 'superseded' row on either path. A branch force-pushed back to
+    an earlier SHA is an instruction to review that SHA now, whether the
+    instruction reaches the queue as a delivery or is re-derived by the startup
+    sweep; making it wait an hour would be a bug, not a saving."""
     url = _db(tmp_path, monkeypatch)
     job_id = ingest.enqueue(INSTALL, REPO_ID, REPO, 7, "a" * 40)
     ingest.supersede(job_id)
     assert {j["id"]: j for j in _jobs(url)}[job_id]["status"] == "superseded"
 
+    assert ingest.enqueue(INSTALL, REPO_ID, REPO, 7, "a" * 40, trigger="reconcile") == job_id
+    assert {j["id"]: j for j in _jobs(url)}[job_id]["status"] == "pending"
+
+    ingest.supersede(job_id)
     assert ingest.enqueue(INSTALL, REPO_ID, REPO, 7, "a" * 40) == job_id
     assert {j["id"]: j for j in _jobs(url)}[job_id]["status"] == "pending"
