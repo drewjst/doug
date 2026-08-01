@@ -36,14 +36,23 @@ executed as written — amendments folded in at their task, never as a second pa
   `outcomes` identity columns (github_repo_id, installation_id, window_days, detail JSON),
   `installations.token_hash`. Note: the Task 6 `installation.created` token mint is superseded —
   hash-only storage makes an install-time mint unrecoverable; M2's dispense endpoint mints.
-- [ ] Tasks 3–5: durable job queue, worker drain, app auth (githubkit auth dep added)
+- [x] Task 3: durable job queue (`ingest.py`) — **plus** `reclaim_stalled()`, a lease-based sweep
+  for claims stranded `'running'` by an instance that died mid-review. Without it such a row is
+  never revivable, so `enqueue` collides forever and that SHA is silently never reviewed; adding
+  `'running'` to the revivable set instead would buy a second paid read on a job still in flight.
+- [ ] Task 4: check run (`check_run.py`) — deviations render `unvalidated` (ADR-0007 + the
+  2026-07-31 derangement FAIL); fallback tier visible in the **title**, never a footnote
+- [ ] Task 5: worker drain — **must call `reclaim_stalled()` once per pass before the first claim**
+  (the other half of Task 3's fix; a young claim must be left strictly alone — that test is the
+  anti-double-spend guarantee)
 - [ ] Task 6: webhook dispatch — **plus** the clock-start branch (`closed && merged` → outcome_jobs,
   never through review-enqueue; closed-unmerged-writes-nothing test), **plus** `pull_request_review`
   ingest → third-party verdict rows (`source='review:<login>'`, no score, no model call). The
   `installation.created` token mint that used to sit here is superseded (see Tasks 1–2); note the
   GitHub App needs its "Pull request review" event subscription enabled at the Task 10 cutover.
-- [ ] Task 7: check run (ADR-0010 supersedes ADR-0003 in the same commit)
-- [ ] Task 8: reconcile-on-startup by head sha
+- [ ] Task 7: reconcile-on-startup by head sha — **must call `reclaim_stalled()` before the enqueue
+  sweep** (startup path only, never per-installation: the sweep is queue-wide, not per-tenant)
+- [ ] Task 8: ADR-0010 (neutral check run) supersedes ADR-0003 in the same commit
 - [ ] Tasks 9–10: delete CI token path, cutover deploy (rebase vs. merged #15 done deliberately)
 - [ ] Research-corpus quarantine: sentinel installation UPDATE + `source='research'`
 
