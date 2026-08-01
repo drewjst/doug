@@ -384,6 +384,31 @@ def test_a_stale_head_is_superseded_and_the_current_one_requeued(tmp_path, monke
     assert posted == []
 
 
+def test_the_stale_head_catch_up_revives_a_failed_job_at_once(tmp_path, monkeypatch):
+    """The SHA that overtook a stale job is enqueued on live terms, not the
+    sweep's. The branch really moved just now, so the row this catch-up
+    collides with must come back at once even if its own review failed
+    minutes ago — a force-push back onto a SHA whose review died in an outage
+    is exactly the case, and FAILED_REVIVE_COOLOFF_SECONDS is a brake on
+    reconcile repeating itself at every cold start, never on a push. Left on
+    the sweep's terms this returns None and the PR is silently unreviewed for
+    an hour, with the check run never posted and nothing to say why."""
+    url = _db(tmp_path, monkeypatch)
+    _wire(monkeypatch, heads={7: "a" * 40})
+    failed_id = ingest.enqueue(**JOB)
+    for _ in range(3):
+        ingest.fail(failed_id, "reader exploded")
+    ingest.enqueue(**{**JOB, "head_sha": "b" * 40})  # a push, then a force-push back
+
+    assert worker.process_job(ingest.claim()) is None  # the "b" job, now stale
+
+    jobs = {j["head_sha"]: j for j in _rows(url, store.review_jobs)}
+    assert jobs["b" * 40]["status"] == "superseded"
+    revived = jobs["a" * 40]
+    assert revived["id"] == failed_id  # the failed row itself, back in the queue
+    assert revived["status"] == "pending" and revived["attempts"] == 0
+
+
 def test_a_force_push_ping_pong_cannot_spin_the_drain(tmp_path, monkeypatch):
     """The seen-set does double duty, and this is the second job.
 
