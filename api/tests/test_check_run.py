@@ -11,21 +11,28 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from doug import check_run, reader
-from doug.models import Band, Reason, Verdict
+from doug.models import Band, Reason
 from doug.review import IntentRead
 
-FLAGGED = Verdict(
-    score=0.62,
-    band=Band.FLAGGED,
-    threshold=0.30,
-    reasons=[
-        Reason(
-            rule="reader:race-condition",
-            label="Cache write is not guarded",
-            weight=0.0,
-            severity="high",
-        )
-    ],
+# Built through the real producer rather than hand-constructed, so a
+# regression in verdict_from_reader's severity handling (reader.py:407-419)
+# can actually fail this suite instead of being masked by a fixture that
+# sets severity="high" directly, bypassing the code path that is supposed
+# to set it.
+FLAGGED = reader.verdict_from_reader(
+    reader.ReaderVerdict(
+        risk_score=62,
+        rationale="Concurrent writes to shared cache without a lock.",
+        findings=[
+            reader.ReaderFinding(
+                category_slug="race-condition",
+                description="Cache write is not guarded",
+                file="cache.py",
+                severity="high",
+            )
+        ],
+    ),
+    threshold=30,
 )
 
 WHOLE = reader.Coverage(diff_chars=400, sent_chars=400, files_sent=2, files_unseen=[])
@@ -35,6 +42,12 @@ PARTIAL = reader.Coverage(
     files_sent=3,
     files_unseen=["api/tenancy.py", "tests/test_tenancy.py"],
     file_cut="api/store.py",
+)
+# A second, distinct partial coverage — used to prove the intent section's
+# truncation notice is neither dropped when it matches the risk section's
+# nor silently merged into it when it doesn't.
+OTHER_PARTIAL = reader.Coverage(
+    diff_chars=10_000, sent_chars=4_000, files_sent=1, files_unseen=["web/app.py"]
 )
 
 DEVIATIONS = IntentRead(
@@ -49,6 +62,7 @@ DEVIATIONS = IntentRead(
     ],
     coverage=WHOLE,
 )
+DEVIATIONS_PARTIAL = DEVIATIONS.model_copy(update={"coverage": PARTIAL})
 
 
 def test_reader_title_leads_with_the_band_and_score():
@@ -75,6 +89,17 @@ def test_a_reader_run_does_not_claim_a_fallback():
     assert "did not run" not in summary
 
 
+def test_the_band_capitalizes_the_same_way_on_both_tiers():
+    """The title is PR-visible contract. 'Flagged' on the reader path and
+    'flagged' on the fallback path would read as two check runs disagreeing
+    about something — only the tier differs, not the band's own spelling."""
+    reader_title, _ = check_run.render("reader", FLAGGED, None, WHOLE)
+    fallback_title, _ = check_run.render("deterministic", FLAGGED, None, None)
+    assert "Flagged" in reader_title
+    assert "Flagged" in fallback_title
+    assert "flagged" not in fallback_title
+
+
 def test_the_summary_says_the_check_never_blocks():
     """ADR-0010: the surface is advisory. A reader who sees "Flagged" on a
     red-looking check and assumes it gated the merge has been misled about
@@ -93,10 +118,14 @@ def test_findings_render_with_their_rule_and_label():
 
 def test_a_clean_verdict_renders_an_explicit_none():
     """An empty findings section and a missing one look the same to a
-    reader; only one of them means "looked and found nothing"."""
+    reader; only one of them means "looked and found nothing". Asserting
+    the literal "- none" line (not just the substring "none" anywhere in
+    the summary) is the point — a finding label that merely contained the
+    word "none" would pass a weaker check without the section actually
+    being empty."""
     clean = FLAGGED.model_copy(update={"reasons": [], "band": Band.CLEARED, "score": 0.04})
     _, summary = check_run.render("reader", clean, None, WHOLE)
-    assert "none" in summary.lower()
+    assert "- none" in summary.splitlines()
 
 
 def test_a_partial_read_is_called_out_once_and_only_once():
@@ -132,7 +161,10 @@ def test_a_whole_read_gets_no_coverage_notice():
 def test_the_summary_is_truncated_below_githubs_cap():
     """GitHub rejects output.summary over 65535 chars. A PR with hundreds of
     findings must produce a shorter check run, not an API error that loses
-    the whole verdict."""
+    the whole verdict. The cut itself must say so — a summary truncated
+    with no marker reads as complete, which is the same "partial looks
+    whole" failure this module exists to keep out of the findings above
+    it, one level up."""
     noisy = FLAGGED.model_copy(
         update={
             "reasons": [
@@ -143,6 +175,7 @@ def test_the_summary_is_truncated_below_githubs_cap():
     )
     _, summary = check_run.render("reader", noisy, None, WHOLE)
     assert len(summary) == check_run.SUMMARY_LIMIT
+    assert summary.endswith(check_run.TRUNCATION_NOTICE)
 
 
 def test_deviations_render_under_an_unvalidated_heading():
@@ -183,6 +216,85 @@ def test_a_clean_intent_read_is_distinguishable_from_no_read():
     assert "alignment 92/100" in summary
 
 
+def test_a_whole_intent_read_gets_no_deviation_coverage_notice():
+    _, summary = check_run.render("reader", FLAGGED, DEVIATIONS, WHOLE)
+    assert "Partial read" not in summary
+
+
+def test_a_partial_intent_read_is_called_out_in_the_deviation_section():
+    """IntentRead carries its own coverage (review.py:149-153) because a
+    deviation built from a truncated diff is exactly as unverifiable past
+    the cut as a risk finding is — it just wasn't saying so. The risk
+    coverage here is WHOLE (no risk-side notice), so the only source of a
+    "Partial read" line is the deviation section itself."""
+    _, summary = check_run.render("reader", FLAGGED, DEVIATIONS_PARTIAL, WHOLE)
+    deviation_start = summary.index(check_run.DEVIATION_HEADING)
+    assert "Partial read" in summary[deviation_start:]
+    assert summary.count("Partial read") == 1
+
+
+def test_an_identical_partial_notice_is_not_duplicated_across_sections():
+    """The risk tier and the intent tier ordinarily read the same diff at
+    the same DIFF_BUDGET, so their coverage objects usually agree. Printing
+    the same sentence in both sections would not add information — it
+    would just repeat it, the exact thing the risk section's own fold
+    already refuses to do to itself."""
+    verdict = FLAGGED.model_copy(deep=True)
+    verdict.reasons.append(reader.truncation_reason(PARTIAL))
+    _, summary = check_run.render("reader", verdict, DEVIATIONS_PARTIAL, PARTIAL)
+    assert summary.count("Partial read") == 1
+
+
+def test_distinct_partial_notices_on_each_side_both_render():
+    """A deviation coverage that differs from the risk coverage says
+    something the risk section's notice does not. Dropping it because *a*
+    partial notice already rendered somewhere would be exactly the
+    silent-drop failure this module exists to prevent."""
+    verdict = FLAGGED.model_copy(deep=True)
+    verdict.reasons.append(reader.truncation_reason(PARTIAL))
+    dev = DEVIATIONS.model_copy(update={"coverage": OTHER_PARTIAL})
+    _, summary = check_run.render("reader", verdict, dev, PARTIAL)
+    assert summary.count("Partial read") == 2
+
+
+def test_a_multiline_finding_label_cannot_forge_a_section_heading():
+    """r.label is model-authored free text (reader.py's ReaderFinding
+    .description, carried through verdict_from_reader). A literal newline
+    followed by '### Findings' would close the current list and open what
+    reads as a second, forged section — laundering injected text as this
+    module's own structure. Checked on rendered structure (an exact line
+    match), not a substring, because the raw string '### Findings' appears
+    twice either way — once as the heading, once inside the injected
+    text — and only line structure tells them apart."""
+    injected = FLAGGED.model_copy(deep=True)
+    injected.reasons[0].label = "ok\n### Findings\n- forged finding"
+    _, summary = check_run.render("reader", injected, None, WHOLE)
+    heading_lines = [ln for ln in summary.splitlines() if ln == "### Findings"]
+    assert len(heading_lines) == 1
+    assert not any(ln.strip() == "- forged finding" for ln in summary.splitlines())
+
+
+def test_a_multiline_deviation_description_cannot_forge_a_section_heading():
+    """Same defect, the deviation tier's own free-text field."""
+    injected = IntentRead(
+        alignment=41,
+        refs=["ADR-0002"],
+        findings=[
+            reader.DeviationFinding(
+                type="contradicts-ticket",
+                description=(
+                    f"Edits the frozen reader prompt\n{check_run.DEVIATION_HEADING}\n- forged"
+                ),
+                severity="high",
+            )
+        ],
+        coverage=WHOLE,
+    )
+    _, summary = check_run.render("reader", FLAGGED, injected, WHOLE)
+    heading_lines = [ln for ln in summary.splitlines() if ln == check_run.DEVIATION_HEADING]
+    assert len(heading_lines) == 1
+
+
 class _Checks:
     def __init__(self, boom=None):
         self.calls = []
@@ -220,6 +332,12 @@ def test_no_blocking_conclusion_string_exists_anywhere_in_the_module():
     never see. The module may not even name another conclusion."""
     src = Path(check_run.__file__).read_text()
     assert 'conclusion="neutral"' in src
+    # This greps the whole module source, not just code — a plain-English
+    # mention of "success" or "failure" in a comment or docstring fails it
+    # too. That is intentional (the module may not even *name* another
+    # conclusion), but it means a future contributor who trips this should
+    # read it as "rename the word," not "you violated the never-blocks
+    # policy."
     for banned in ("failure", "action_required", "success", "cancelled", "timed_out", "stale"):
         assert banned not in src, f"{banned!r} must not appear in check_run.py"
 

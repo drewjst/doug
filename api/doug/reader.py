@@ -408,7 +408,12 @@ def verdict_from_reader(rv: ReaderVerdict, threshold: float | None = None) -> Ve
     thr = reader_threshold() if threshold is None else threshold
     band = Band.FLAGGED if rv.risk_score >= thr else Band.CLEARED
     reasons = [
-        Reason(rule=f"reader:{f.category_slug}", label=f.description, weight=0.0)
+        Reason(
+            rule=f"reader:{f.category_slug}",
+            label=f.description,
+            weight=0.0,
+            severity=f.severity,
+        )
         for f in rv.findings
     ]
     return Verdict(
