@@ -503,6 +503,40 @@ def test_a_reconcile_sweep_revives_a_failed_job_once_its_cooloff_has_passed(
     assert row["status"] == "pending" and row["attempts"] == 0
 
 
+def test_a_failed_job_with_no_finish_time_is_healed_rather_than_stranded(
+    tmp_path, monkeypatch
+):
+    """A 'failed' row with no finished_at should not exist — fail() writes
+    finished_at in the same UPDATE that sets 'failed' at the cap — and that is
+    precisely why the reconcile branch has to answer for the state anyway. The
+    cooloff asks whether finished_at is older than an hour, and SQL answers that
+    question NULL, not true, for a row that has none: the row would fail the
+    comparison on every sweep, forever, and reconcile is the only thing that
+    ever revisits it. The PR would then never be reviewed again — not delayed an
+    hour, gone. An older row written before fail() set finished_at at the cap, a
+    partial write, or a future change to fail() all reach that state, and none
+    of them are a reason to abandon a customer's PR, so the sweep heals it.
+    """
+    url = _db(tmp_path, monkeypatch)
+    job_id = ingest.enqueue(INSTALL, REPO_ID, REPO, 7, "a" * 40)
+    for _ in range(3):
+        ingest.fail(job_id, "reader exploded")
+    # Stand in for however the row lost its finish time; what matters is that a
+    # 'failed' row reaches the sweep with nothing for the cooloff to compare.
+    with create_engine(url).begin() as conn:
+        conn.execute(
+            store.review_jobs.update()
+            .where(store.review_jobs.c.id == job_id)
+            .values(finished_at=None)
+        )
+    row = {j["id"]: j for j in _jobs(url)}[job_id]
+    assert row["status"] == "failed" and row["finished_at"] is None
+
+    assert ingest.enqueue(INSTALL, REPO_ID, REPO, 7, "a" * 40, trigger="reconcile") == job_id
+    row = {j["id"]: j for j in _jobs(url)}[job_id]
+    assert row["status"] == "pending" and row["attempts"] == 0
+
+
 def test_a_superseded_job_revives_immediately_on_either_path(tmp_path, monkeypatch):
     """The cooloff is a penalty for failing, not for being overtaken, and it is
     charged to the caller that repeats itself — so neither reason to wait
