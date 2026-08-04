@@ -213,6 +213,7 @@
     </div>
     <div class="group">
       <div class="g">Concepts</div>
+      <a href="#how-doug-decides"><span class="dot ok"></span>How Doug decides</a>
       <a href="#risk-routing"><span class="dot ok"></span>Risk routing</a>
       <a href="#labels"><span class="dot ok"></span>Defect labels</a>
       <a href="#cleared-band"><span class="dot ok"></span>The cleared band</a>
@@ -312,6 +313,72 @@
        30%     <span class="ok">57%</span>        31%      30%
 
 <span class="dim">AUC — doug 0.640 · size-only 0.552 · random 0.500</span></div>
+        </div>
+      </div></div>
+    </section>
+
+    <!-- HOW DOUG DECIDES -->
+    <section class="row" id="how-doug-decides">
+      <div class="prose">
+        <p class="kick">Concepts</p>
+        <h2>How Doug decides <span class="badge b-ok">Available</span></h2>
+        <p>Everything on this page is one decision made twice: <b>which pull requests are worth a
+          model, and which are worth a human.</b> The diagram is the whole product.</p>
+        <p>The first tier is deterministic and runs on <b>every</b> PR — paths, size, whether tests
+          moved, whether a migration is in the diff, weighted by rules learned from
+          <i>that repository's own</i> revert history. No model, no network, milliseconds. It is
+          cheap enough to be wrong about occasionally, which is what lets it run on everything.</p>
+        <p>Only the flagged minority gets read by a model. That is the structural difference from
+          reviewers that read every diff: <b>Doug's cost tracks risk volume, not PR volume</b> — so
+          it does not scale with exactly the thing agents are inflating. The deep read uses a frozen
+          prompt (so rates stay comparable across time), is spend-capped before the call is made,
+          and reports what it could <i>not</i> see rather than presenting a partial read as a whole
+          one.</p>
+        <p>The split point is a dial you set, not a constant we picked. Flagging 20% catches less
+          than flagging 30% and costs less; the <a href="#cleared-band">cleared-band</a> table tells
+          you what each setting costs in misses, on your own repository, before you choose.</p>
+        <p>The verdict lands as one <b>neutral</b> check run. It never blocks a merge and never
+          leaves a review comment — a routing signal, not another opinion in the pile.</p>
+        <p>And a verdict is not finished when it is posted. The clock starts at merge, and 14 and 60
+          days later the repository's own history grades it: reverted, survived, or honestly
+          censored. That grade is what makes the cleared-band miss rate a measurement instead of a
+          promise.</p>
+      </div>
+      <div class="codecol"><div class="sticky">
+        <div class="block">
+          <div class="bhead"><span class="t">ONE PR'S PATH</span></div>
+          <div class="bcode"> <span class="wt">every PR</span>
+    │
+    ▼
+ <span class="wt">EXTRACT</span>   paths·size·tests?·migration?
+    │      <span class="dim">deterministic · no model · ms</span>
+    ▼
+ <span class="wt">SCORE</span>     base + Σ matched rules
+    │      <span class="dim">learned from THIS repo's history</span>
+    ▼
+ ┌──┴───────────────┐
+ ▼                  ▼
+<span class="ok">CLEARED</span>         <span class="wt">FLAGGED</span>   <span class="cm">← the budget</span>
+<span class="ok">70-80%</span>          <span class="wt">20-30%</span>      <span class="cm">you set</span>
+ │                  │
+ │                  ▼
+ │             <span class="wt">DEEP READ</span> · one model pass
+ │             <span class="dim">frozen prompt · spend-capped</span>
+ │             <span class="dim">reports what it could NOT see</span>
+ │                  │
+ └────────┬─────────┘
+          ▼
+  <span class="wt">ONE NEUTRAL CHECK RUN</span>     <span class="cm">[preview]</span>
+  <span class="dim">never blocks · never comments</span>
+          │
+          ▼
+  merged → day 14/60 →      <span class="cm">[preview]</span>
+  <span class="wt">ADJUDICATED</span>
+  <span class="dim">reverted · survived · censored</span>
+          │
+          ▼
+  <span class="dim">cleared-band miss rate, published</span>
+  <span class="dim">on a pre-committed date</span></div>
         </div>
       </div></div>
     </section>

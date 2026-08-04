@@ -38,6 +38,30 @@ had time to be reverted).
 
 Harvests are checkpointed — kill and relaunch with the same command to resume.
 
+## How Doug decides — the whole product in one path
+    every PR
+      -> EXTRACT   paths, size, tests touched?, migration?   [AVAILABLE]
+                   deterministic, no model, milliseconds
+      -> SCORE     base + sum of matched rules, learned from
+                   THIS repo's own revert history
+      -> CLEARED (~70-80%)        FLAGGED (~20-30%, your budget)
+                                    -> DEEP READ, one model pass,
+                                       frozen prompt, spend-capped,
+                                       reports what it could NOT see
+      -> ONE NEUTRAL CHECK RUN — never blocks, never comments  [PREVIEW]
+      -> merged, then day 14 and day 60 -> ADJUDICATED         [PREVIEW]
+         reverted | survived | censored
+      -> cleared-band miss rate, published on a pre-committed date
+One decision made twice: which PRs are worth a model, and which are worth a
+human. The first tier is deterministic and runs on EVERY PR, which is what makes
+it affordable to run on everything. Only the flagged minority is read by a model
+— so Doug's cost tracks RISK volume, not PR volume, and does not scale with the
+thing agents are inflating. The split point is a dial you set, not a constant:
+the cleared-band table says what each budget costs in misses on your own repo
+before you choose. A verdict is not finished when posted — the clock starts at
+merge and the repo's own history grades it, which is what makes the miss rate a
+measurement rather than a promise.
+
 ## Concepts
 - Capture curve (AVAILABLE): reading only the top-scored N% of PRs (the budget),
   what share of defect-inducing PRs lands in that band? capture@budget is the
