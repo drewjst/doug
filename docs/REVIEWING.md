@@ -462,3 +462,42 @@ with an empty table the startup sweep enqueues nothing *by construction*. That
 had been recorded in HANDOFF as "the webhook path drains jobs promptly, so at
 any boot there is nothing pending for the sweep to find" — a plausible
 explanation for the right observation and the wrong reason.
+
+## Your disposition is invisible to the next review pass — and writing it down makes it more so
+
+Two Doug passes on PR #48, 2026-08-04. The migration finding
+(`missing-migration-dependency`, then `schema-dependency`) came back on the second
+pass, after the first had been disproved *against production* and the disproof
+written into this PR's own design doc. Doug was arguing with an answer it had
+never been shown: the design doc was in its **Never sent** list both times.
+
+That makes the unmigrated-column rule **5/5 disproved** across PRs 25, 30 (twice)
+and 48 (twice) — see "No migration for this column…" above, which already
+documented the reasoning and already warned against adding a defensive `ALTER`.
+The new part is the mechanism, and it is slightly perverse:
+
+**The read budget is fixed (30,000 chars) and the diff is not.** Across one
+session of answering findings in-repo, this PR went 105k → 122k chars and Doug's
+coverage went **29% → 24%**. Every disposition, limit and roadmap item added to
+the branch pushed the percentage down. Documenting the answer is what put the
+answer out of reach.
+
+Consequences for how to work:
+
+1. **A repeated finding is not persistence, and not new evidence.** Check the
+   coverage line for whether the file carrying your disposition was sent at all
+   before you treat a second flag as a signal worth re-litigating.
+2. **Put the disposition where the reader will see it** — a PR comment or a
+   code comment near the flagged line — not only in a doc the budget will cut.
+   The findings log is the durable record; the code is the reachable one.
+3. **Expect coverage to fall as you respond to a review.** If a finding matters,
+   settle it in code or in a comment beside the code, because prose added
+   elsewhere in the branch measurably reduces what the next pass reads.
+
+The standing advice not to add a speculative `ALTER … ADD COLUMN` now has a
+concrete cost attached. One was written for `installations.token_hash` on this
+PR and reverted: `ALTER TABLE` on a table that does not exist raises
+`no such table`, which `_SATISFIED` does not match, so `apply()` would have
+propagated it and **crash-looped the revision on cold start**. Three existing
+tests caught it immediately. Production already had the column — verified by
+querying `information_schema`, which is the check that should have come first.
