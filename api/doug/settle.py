@@ -60,12 +60,15 @@ _SCHEMA_SLUGS = frozenset(
     }
 )
 
-# `table.column`, backticked or bare — how every disproved instance in
-# findings-log.jsonl actually phrased the claim (`installations.token_hash`,
-# `verdicts.head_sha`, `verdicts.prompt_hash`). A bare table name with no
-# dot (the whole-new-table shape) deliberately does not match — see the
-# module docstring.
-_TABLE_DOT_COLUMN = re.compile(r"`?([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)`?")
+# `` `table.column` `` — backticks REQUIRED, not optional. Every disproved
+# instance in findings-log.jsonl phrased the claim this way
+# (`installations.token_hash`, `verdicts.head_sha`, `verdicts.prompt_hash`);
+# Doug's second review of PR #49 (reader:overly-broad-regex-match, residual)
+# found that an optional backtick let plain prose — "review.score_one",
+# "migrations.py" — read as a claim just because it has a dot. A bare table
+# name with no dot (the whole-new-table shape) deliberately does not match
+# either way — see the module docstring.
+_TABLE_DOT_COLUMN = re.compile(r"`([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)`")
 
 
 def looks_like_missing_import_finding(f: ReaderFinding) -> bool:
@@ -205,13 +208,18 @@ def settle_many(
 
 
 def looks_like_schema_dependency_finding(f: ReaderFinding) -> bool:
+    """Slug-only, deliberately — see Doug's second review of PR #49
+    (reader:heuristic-false-positive). A free-text fallback ('migrat' +
+    'missing') used to also classify by description, and it caught findings
+    that have nothing to do with column existence — a migration script's
+    own concurrency bug, for instance — into this settlement path, where an
+    unrelated real `table.column` mention elsewhere in the text could drop
+    them. Every one of the 5 disproved historical instances
+    (findings-log.jsonl) used a slug already in _SCHEMA_SLUGS, so the
+    fallback bought no real recall against the evidence — only false-drop
+    risk against everything it wasn't."""
     slug = f.category_slug.lower().removeprefix("reader:")
-    if slug in _SCHEMA_SLUGS:
-        return True
-    desc = f.description.lower()
-    return "migrat" in desc and any(
-        w in desc for w in ("missing", "no migration", "not migrated", "unmigrated")
-    )
+    return slug in _SCHEMA_SLUGS
 
 
 def claimed_columns(f: ReaderFinding) -> list[tuple[str, str]]:

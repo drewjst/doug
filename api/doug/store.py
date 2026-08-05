@@ -382,6 +382,14 @@ def columns_of(table: str) -> frozenset[str] | None:
     this codebase exists to avoid. Same posture as review.head_file_text's
     own catch-all: settlement is advisory, never load-bearing for whether a
     review completes.
+
+    UNCACHED (Doug's second review of PR #49, reader:performance-overhead,
+    low): called once per claimed table per scored PR, no memoization. Real,
+    deliberately not fixed — findings with schema claims are rare (5
+    instances total across 48 PRs to date) and each call is one indexed
+    metadata query against Doug's own connection-pooled engine, not a
+    per-PR cost that scales with review volume the way the read itself
+    does. Revisit if that ratio changes.
     """
     engine = _get_engine()
     if engine is None:

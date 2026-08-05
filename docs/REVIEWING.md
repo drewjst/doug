@@ -219,13 +219,46 @@ taken on faith (REVIEWING.md's own rule):
    `SpendCapExceeded`/`ReaderError`) and crash the review job. Fixed: same
    catch-all posture as `review.head_file_text`, returns None on any
    failure.
-3. **`reader:environment-drift`**, low: `columns_of` reads `DATABASE_URL`,
-   which is Doug's own ledger database, not a per-target-repo one. Correct
-   only because self-review makes the two coincide; degrades safely (not
-   wrongly) against a real tenant repo, since a tenant's table names
-   essentially never collide with Doug's own — but it is a silent no-op
-   there, not a working check, until Doug can reach the reviewed repo's own
-   schema. Documented, not yet fixed — no current install exercises it.
+3. **`reader:environment-drift`**, low → **re-raised medium on the fix
+   commit's own review**: `columns_of` reads `DATABASE_URL`, which is Doug's
+   own ledger database, not a per-target-repo one. Correct only because
+   self-review makes the two coincide; degrades safely (not wrongly)
+   against a real tenant repo, since a tenant's table names essentially
+   never collide with Doug's own — but it is a silent no-op there, not a
+   working check, until Doug can reach the reviewed repo's own schema.
+   Documented, not fixed — no current install exercises it.
+
+**The fix commit got its own review, and found two more** — the settlement
+mechanism's fragility is a moving target, not a one-shot bug:
+
+4. **`reader:overly-broad-regex-match`, residual**: fix #1 above only
+   guarded the case where a bare backtick name *also* appears. Plain prose
+   with no backticks at all — "review.score_one calls settle without
+   checking migrations.py first" — still read `migrations.py` and
+   `review.score_one` as claimed pairs, because the backtick in
+   `_TABLE_DOT_COLUMN` was optional. Every real historical instance
+   (findings-log.jsonl) quoted its claim in backticks; nothing was lost by
+   requiring them. Fixed: backticks are now mandatory in the pattern
+   itself, not an optional wrapper.
+5. **`reader:heuristic-false-positive`**: the free-text fallback in
+   `looks_like_schema_dependency_finding` ('migrat' + 'missing') classified
+   findings that have nothing to do with column existence — a migration
+   script's own concurrency bug, for instance — into this settlement path,
+   where an unrelated real `table.column` mention elsewhere in the same
+   description could drop them. All 5 disproved historical instances used a
+   slug already in `_SCHEMA_SLUGS`; the fallback bought no recall against
+   the evidence, only false-drop risk against everything it wasn't. Fixed:
+   slug-only, same as the missing-import filter's own core check.
+
+Also raised, not fixed: **`reader:performance-overhead`** (low) —
+`columns_of` is uncached, one query per claimed table per scored PR.
+Deliberately deferred — schema claims are rare (5 in 48 PRs) and each call
+is one indexed metadata query against Doug's own pooled engine, not a cost
+that scales with review volume. And a **beyond-ticket deviation** (intent
+tier, unvalidated per ADR-0007, alignment 88/100): post-hoc settlement of
+reader *output* rests on the missing-import precedent and this file's prose,
+not an ADR — ADR-0002 freezes the prompt/schema/model, not what happens to
+findings after. Worth an explicit decision record; not acted on here.
 
 `layer` is `doug` or `agent-reviewer` — the two layers this file exists to track, kept
 separable so one never speaks for the other. `verdict` is `real | disproved | adjacent`.

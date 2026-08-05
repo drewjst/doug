@@ -131,6 +131,45 @@ def test_claimed_columns_is_empty_when_a_bare_table_mention_accompanies_a_real_p
     assert settle.claimed_columns(f) == []
 
 
+def test_claimed_columns_ignores_dotted_mentions_without_backticks():
+    """Doug's second review of PR #49 (reader:overly-broad-regex-match,
+    residual): plain prose like 'migrations.py' or 'review.score_one' must
+    not be read as a table.column claim just because it has a dot — every
+    real historical instance quoted the claim in backticks."""
+    f = _sf(
+        desc=(
+            "review.score_one calls settle without checking migrations.py "
+            "first; verdicts.head_sha has no migration entry"
+        )
+    )
+    assert settle.claimed_columns(f) == []
+
+
+def test_does_not_classify_a_non_column_migration_finding_via_free_text():
+    """Doug's second review of PR #49 (reader:heuristic-false-positive):
+    the free-text fallback ('migrat' + 'missing') can classify a finding
+    that has nothing to do with column existence — e.g. a concurrency bug
+    in a migration script — into the settlement path, where an unrelated
+    real `table.column` mention in the same text drops it."""
+    f = ReaderFinding(
+        category_slug="race-condition",
+        description=(
+            "The migration script is missing a WHERE clause guard; "
+            "concurrent runs can double-apply it. Unrelated: "
+            "`verdicts.head_sha` is a real column."
+        ),
+        file="api/doug/migrations.py",
+        severity="high",
+    )
+    assert settle.looks_like_schema_dependency_finding(f) is False
+    rv = ReaderVerdict(risk_score=70, rationale="x", findings=[f])
+    out, dropped = settle.drop_disproved_schema_findings(
+        rv, lambda table: {"head_sha"} if table == "verdicts" else None
+    )
+    assert dropped == []
+    assert out.findings == [f]
+
+
 def test_does_not_settle_a_whole_table_claim_via_an_incidental_column_mention():
     """Same case as above, through the public entry point."""
     f = _sf(
